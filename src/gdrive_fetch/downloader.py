@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from .client import DriveClient
+from .client import usable_partial
 from .models import DriveFile
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
+from enum import StrEnum
 from pathlib import Path
 from rich.progress import BarColumn
 from rich.progress import DownloadColumn
@@ -27,6 +29,63 @@ class DownloadReport:
     @property
     def ok(self) -> bool:
         return not self.failed
+
+
+class Action(StrEnum):
+    """What a real run would do with one file."""
+
+    DOWNLOAD = "download"
+    RESUME = "resume"
+    SKIP = "skip"
+
+
+@dataclass(slots=True, frozen=True)
+class FilePlan:
+    """One file's verdict: what `download` would do with it, and why."""
+
+    file: DriveFile
+    dest: Path
+    action: Action
+    reason: str
+    resume_from: int = 0
+
+    @property
+    def transfer_bytes(self) -> int | None:
+        """Bytes this entry would pull over the wire.
+
+        :returns: the byte count, or ``None`` when Drive reports no size
+            (Google-native exports), so the caller can say "unknown".
+        """
+        if self.action is Action.SKIP:
+            return 0
+        if self.file.size is None:
+            return None
+        return max(0, self.file.size - self.resume_from)
+
+
+@dataclass(slots=True)
+class DownloadPlan:
+    """What `download` would do, without having done any of it."""
+
+    entries: list[FilePlan] = field(default_factory=list)
+
+    def of(self, action: Action) -> list[FilePlan]:
+        """Entries with a given verdict.
+
+        :param action: the verdict to filter on.
+        :returns: the matching entries, in listing order.
+        """
+        return [e for e in self.entries if e.action is action]
+
+    @property
+    def transfer_bytes(self) -> int:
+        """Bytes to transfer, counting entries of unknown size as zero."""
+        return sum(e.transfer_bytes or 0 for e in self.entries)
+
+    @property
+    def unknown_sizes(self) -> int:
+        """How many entries would transfer an amount Drive does not report."""
+        return sum(1 for e in self.entries if e.transfer_bytes is None)
 
 
 async def collect(client: DriveClient, file_id: str) -> tuple[list[DriveFile], bool]:
@@ -63,16 +122,95 @@ def _md5(path: Path) -> str:
     return h.hexdigest()
 
 
-async def _already_present(file: DriveFile, dest: Path, verify: bool) -> bool:
+async def _local_state(file: DriveFile, dest: Path, verify: bool) -> tuple[bool, str]:
+    """Decide whether `dest` already satisfies `file`, and say why.
+
+    This is the one place that answers the question, so `download` and `plan`
+    cannot drift apart in what they consider "already there".
+
+    :param file: the Drive metadata to compare against.
+    :param dest: the local path, which need not exist.
+    :param verify: also compare md5 when Drive reports one.
+    :returns: ``(present, reason)``; `reason` explains either verdict.
+    """
     if not dest.exists():
-        return False
+        return False, "missing locally"
     if file.export:
-        return True  # no size/md5 for exports; existence is the best we can do
-    if file.size is not None and dest.stat().st_size != file.size:
-        return False
+        # No size/md5 for exports; existence is the best we can do.
+        return True, "present (export: no size or md5 to check)"
+    local = dest.stat().st_size
+    if file.size is not None and local != file.size:
+        return False, f"size differs (local {local}, remote {file.size})"
     if verify and file.md5:
-        return await asyncio.to_thread(_md5, dest) == file.md5
-    return True
+        if await asyncio.to_thread(_md5, dest) == file.md5:
+            return True, "size and md5 match"
+        return False, "md5 differs"
+    return True, "size matches"
+
+
+async def _already_present(file: DriveFile, dest: Path, verify: bool) -> bool:
+    present, _ = await _local_state(file, dest, verify)
+    return present
+
+
+async def _targets(client: DriveClient, file_id: str) -> dict[DriveFile, Path]:
+    """Map every file under `file_id` to its path relative to the output dir.
+
+    :param client: the Drive client to list through.
+    :param file_id: id of a folder or of a single file.
+    :returns: each file with the relative path it would be written to.
+    """
+    files, is_folder = await collect(client, file_id)
+    if not is_folder:
+        return {files[0]: Path(files[0].local_name)}
+    return _dedupe(files)
+
+
+async def plan(
+    client: DriveClient,
+    file_id: str,
+    dest_dir: Path,
+    *,
+    verify: bool = True,
+    skip_existing: bool = True,
+    resume: bool = True,
+) -> DownloadPlan:
+    """Work out what `download` would do, without transferring anything.
+
+    Metadata is read from Drive and compared against what is already in
+    `dest_dir`. Nothing is downloaded, written or deleted — in particular an
+    unusable ``.part`` file is reported but left on disk, where a real run
+    would remove it.
+
+    :param client: the Drive client to read metadata through.
+    :param file_id: id of the folder or file to inspect.
+    :param dest_dir: the directory files would be mirrored into.
+    :param verify: compare md5 as well as size, as `download` would.
+    :param skip_existing: report matching files as skipped rather than fetched.
+    :param resume: account for ``.part`` files left by an interrupted run.
+    :returns: one :class:`FilePlan` per file, in listing order.
+    """
+    out = DownloadPlan()
+    for f, rel in (await _targets(client, file_id)).items():
+        dest = dest_dir / rel
+        present, reason = await _local_state(f, dest, verify)
+        if present and skip_existing:
+            out.entries.append(FilePlan(f, dest, Action.SKIP, reason))
+            continue
+        if present:
+            reason = f"{reason}, but --overwrite given"
+        part = dest.with_name(dest.name + ".part")
+        # Exports ignore Range, so a .part is never resumable for them.
+        offset = usable_partial(part, f.size) if resume and not f.export else 0
+        if offset:
+            out.entries.append(
+                FilePlan(
+                    f, dest, Action.RESUME, f"{offset} bytes already in .part", offset
+                )
+            )
+        else:
+            out.entries.append(FilePlan(f, dest, Action.DOWNLOAD, reason))
+    return out
 
 
 async def download(
@@ -95,16 +233,11 @@ async def download(
     - md5 is verified after download when `verify` and Drive reports one.
     - Partial `.part` files from an interrupted run are continued when `resume`.
     """
-    files, is_folder = await collect(client, file_id)
-    if not is_folder:
-        f = files[0]
-        targets = {f: Path(f.local_name)}
-    else:
-        targets = _dedupe(files)
+    targets = await _targets(client, file_id)
 
     report = DownloadReport()
     sem = asyncio.Semaphore(max(1, concurrency))
-    total_bytes = sum(f.size or 0 for f in files)
+    total_bytes = sum(f.size or 0 for f in targets)
 
     progress = Progress(
         TextColumn("[bold blue]{task.fields[name]}", justify="right"),

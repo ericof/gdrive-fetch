@@ -10,12 +10,13 @@ transfers.
   file that the next run continues via HTTP `Range`; md5 verified; unchanged files skipped
 - Google Docs/Sheets/Slides exported as `.docx`/`.xlsx`/`.pptx`
 - Retries with exponential backoff on 429/5xx/quota 403
+- `--dry-run` compares Drive against your output folder without transferring
 - Usable as a library or a CLI
 
 ## Setup
 
 ```sh
-uv sync
+make install
 ```
 
 ### Credentials (pick one)
@@ -49,6 +50,35 @@ Pass `--no-resume` to discard `.part` files and start clean.
 Google-native exports (Docs/Sheets/Slides) are never resumed — the export
 endpoint neither reports a size nor honours `Range`.
 
+### Dry run
+
+`-n` / `--dry-run` fetches metadata only, compares it against what is already
+in `-o`, and prints the verdict per file. Nothing is downloaded, written or
+deleted — an unusable `.part` file is reported but left alone, where a real run
+would remove it.
+
+```sh
+uv run gdrive-fetch <FOLDER_URL_OR_ID> -o ./out --dry-run
+```
+
+```
+ action     file                 size   why
+ download   fresh.bin          5.0 kB   missing locally
+ skip       done.bin           1.0 kB   size and md5 match
+ resume     partial.bin        1.0 kB   300 bytes already in .part
+ download   changed.bin        1.0 kB   md5 differs
+ download   Meeting Notes.docx      ?   missing locally
+ download   reports/q3.bin   900.0 kB   missing locally
+
+4 to download, 1 to resume, 1 up to date — 906.7 kB to transfer
+(+1 of unknown size) into ./out
+```
+
+The comparison honours the same flags as a real run, so `--no-verify` (size
+only, no md5), `--overwrite` and `--no-resume` all change the plan the way they
+would change the download. Google-native exports have no size or md5 to compare,
+so they are always listed as `download` with an unknown size.
+
 ## Library use
 
 ```python
@@ -68,11 +98,13 @@ asyncio.run(main())
 ```
 
 `client.walk(folder_id)` is an async iterator of `DriveFile` if you only want the tree.
+`plan(client, file_id, dest_dir)` returns the same comparison the CLI renders,
+as a `DownloadPlan` of `FilePlan` entries.
 
 ## Development
 
 ```sh
-uv run ruff check . && uv run mypy src && uv run pytest
+make check && make test
 ```
 
 Tests run against an in-memory Drive v3 fake (`tests/conftest.py`) served

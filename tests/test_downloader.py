@@ -7,7 +7,10 @@ from .conftest import write_part
 from collections import deque
 from gdrive_fetch.client import DriveClient
 from gdrive_fetch.downloader import _dedupe
+from gdrive_fetch.downloader import Action
 from gdrive_fetch.downloader import download
+from gdrive_fetch.downloader import FilePlan
+from gdrive_fetch.downloader import plan
 from gdrive_fetch.models import DriveFile
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -183,3 +186,201 @@ async def test_failures_do_not_abort_other_files(
 
     assert report.downloaded == [tmp_path / "good.bin"]
     assert set(report.failed) == {tmp_path / "bad.bin"}
+
+
+# ------------------------------------------------------------------ dry run
+
+
+async def _plan_by_name(
+    client: DriveClient, root: str, out: Path
+) -> dict[str, FilePlan]:
+    """The plan for `root`, keyed by the local file name each entry targets."""
+    result = await plan(client, root, out)
+    return {e.dest.name: e for e in result.entries}
+
+
+async def test_plan_reports_every_file_as_missing(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", b"aaa", root)
+    sub = drive.folder("sub", root)
+    drive.file("b.bin", b"bbbb", sub)
+
+    result = await plan(client, root, tmp_path)
+
+    assert [e.action for e in result.entries] == [Action.DOWNLOAD] * 2
+    assert {e.reason for e in result.entries} == {"missing locally"}
+    assert result.transfer_bytes == 7  # 3 + 4
+    assert sorted(e.dest.relative_to(tmp_path).as_posix() for e in result.entries) == [
+        "a.bin",
+        "sub/b.bin",
+    ]
+
+
+async def test_plan_skips_what_already_matches(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", DATA, root)
+    (tmp_path / "a.bin").write_bytes(DATA)
+
+    [entry] = (await plan(client, root, tmp_path)).entries
+
+    assert entry.action is Action.SKIP
+    assert entry.reason == "size and md5 match"
+    assert entry.transfer_bytes == 0
+
+
+async def test_plan_flags_a_size_mismatch(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", DATA, root)
+    (tmp_path / "a.bin").write_bytes(b"short")
+
+    [entry] = (await plan(client, root, tmp_path)).entries
+
+    assert entry.action is Action.DOWNLOAD
+    assert entry.reason == f"size differs (local 5, remote {len(DATA)})"
+    assert entry.transfer_bytes == len(DATA)
+
+
+async def test_plan_flags_a_checksum_mismatch(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", DATA, root)
+    (tmp_path / "a.bin").write_bytes(b"X" * len(DATA))  # right size, wrong bytes
+
+    [entry] = (await plan(client, root, tmp_path)).entries
+
+    assert entry.action is Action.DOWNLOAD
+    assert entry.reason == "md5 differs"
+
+
+async def test_plan_trusts_size_alone_without_verify(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", DATA, root)
+    (tmp_path / "a.bin").write_bytes(b"X" * len(DATA))
+
+    [entry] = (await plan(client, root, tmp_path, verify=False)).entries
+
+    assert entry.action is Action.SKIP
+    assert entry.reason == "size matches"
+
+
+async def test_plan_counts_only_the_missing_bytes_of_a_partial(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("big.bin", DATA, root)
+    write_part(tmp_path / "big.bin", DATA[:300])
+
+    [entry] = (await plan(client, root, tmp_path)).entries
+
+    assert entry.action is Action.RESUME
+    assert entry.resume_from == 300
+    assert entry.reason == "300 bytes already in .part"
+    assert entry.transfer_bytes == len(DATA) - 300
+
+
+async def test_plan_ignores_a_partial_when_resume_is_off(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("big.bin", DATA, root)
+    write_part(tmp_path / "big.bin", DATA[:300])
+
+    [entry] = (await plan(client, root, tmp_path, resume=False)).entries
+
+    assert entry.action is Action.DOWNLOAD
+    assert entry.transfer_bytes == len(DATA)
+
+
+async def test_plan_overwrite_re_fetches_a_matching_file(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", DATA, root)
+    (tmp_path / "a.bin").write_bytes(DATA)
+
+    [entry] = (await plan(client, root, tmp_path, skip_existing=False)).entries
+
+    assert entry.action is Action.DOWNLOAD
+    assert entry.reason == "size and md5 match, but --overwrite given"
+
+
+async def test_plan_reports_exports_with_unknown_size(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.gdoc("Notes", root)
+
+    result = await plan(client, root, tmp_path)
+    [entry] = result.entries
+
+    assert entry.dest.name == "Notes.docx"
+    assert entry.action is Action.DOWNLOAD
+    assert entry.transfer_bytes is None
+    assert result.unknown_sizes == 1
+    assert result.transfer_bytes == 0
+
+
+async def test_plan_touches_nothing_on_disk(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    """A dry run must not write, delete or transfer anything.
+
+    The oversized .part is the sharp case: a real run deletes it (it cannot be
+    a prefix of the file), so the plan has to reach the same verdict through
+    the read-only half of that check.
+    """
+    root = drive.folder("root")
+    fid = drive.file("big.bin", DATA, root)
+    oversized = write_part(tmp_path / "big.bin", DATA + b"extra")
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    [entry] = (await plan(client, root, tmp_path)).entries
+
+    assert entry.action is Action.DOWNLOAD  # the partial is unusable
+    assert entry.resume_from == 0
+    assert oversized.exists()  # ...but a dry run leaves it alone
+    assert oversized.stat().st_size == len(DATA) + 5
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert drive.media_requests(fid) == []  # metadata only, no transfers
+
+
+async def test_plan_handles_a_single_file_target(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    fid = drive.file("solo.bin", DATA, None)
+
+    [entry] = (await plan(client, fid, tmp_path)).entries
+
+    assert entry.dest == tmp_path / "solo.bin"
+    assert entry.action is Action.DOWNLOAD
+    assert drive.media_requests(fid) == []
+
+
+async def test_plan_agrees_with_what_download_then_does(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    """The plan is only useful if a real run makes the same choices."""
+    root = drive.folder("root")
+    drive.file("fresh.bin", b"new", root)
+    drive.file("done.bin", DATA, root)
+    drive.file("partial.bin", DATA, root)
+    (tmp_path / "done.bin").write_bytes(DATA)
+    write_part(tmp_path / "partial.bin", DATA[:100])
+
+    before = await _plan_by_name(client, root, tmp_path)
+    report = await download(client, root, tmp_path, quiet=True)
+
+    assert before["fresh.bin"].action is Action.DOWNLOAD
+    assert before["done.bin"].action is Action.SKIP
+    assert before["partial.bin"].action is Action.RESUME
+    assert report.skipped == [tmp_path / "done.bin"]
+    assert sorted(p.name for p in report.downloaded) == ["fresh.bin", "partial.bin"]

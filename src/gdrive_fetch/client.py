@@ -306,20 +306,31 @@ def _endpoint(file: DriveFile) -> tuple[str, dict[str, str], bool]:
     return f"/files/{file.id}", {"alt": "media", "supportsAllDrives": "true"}, True
 
 
-def _partial_offset(part: Path, size: int | None) -> int:
+def usable_partial(part: Path, size: int | None) -> int:
     """Return how many bytes of an existing ``.part`` file are worth keeping.
 
-    A partial longer than the file itself cannot be a prefix of it, so it is
-    discarded rather than resumed.
+    A partial longer than the file itself cannot be a prefix of it, so none of
+    it is usable. This only ever calls ``stat()``: it is the read-only half of
+    :func:`_partial_offset`, and `plan` relies on it leaving the disk alone.
 
     :param part: the ``.part`` file, which need not exist.
     :param size: the file's size as Drive reports it, or ``None`` when unknown.
     :returns: the byte offset to resume from; ``0`` to start over.
     """
     start = part.stat().st_size if part.exists() else 0
-    if size is not None and start > size:
+    return 0 if size is not None and start > size else start
+
+
+def _partial_offset(part: Path, size: int | None) -> int:
+    """As :func:`usable_partial`, but delete a partial that cannot be resumed.
+
+    :param part: the ``.part`` file, which need not exist.
+    :param size: the file's size as Drive reports it, or ``None`` when unknown.
+    :returns: the byte offset to resume from; ``0`` to start over.
+    """
+    start = usable_partial(part, size)
+    if start == 0 and part.exists() and part.stat().st_size:
         part.unlink()
-        return 0
     return start
 
 
