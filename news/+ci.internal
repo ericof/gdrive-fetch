@@ -1,0 +1,2 @@
+Add a GitHub Actions workflow running ruff format, ruff check, mypy and the test
+suite, plus a Dependabot configuration for `github-actions` and `uv`.
