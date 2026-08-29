@@ -204,11 +204,44 @@ def _by_path(targets: dict[DriveFile, Path]) -> list[tuple[DriveFile, Path]]:
     return sorted(targets.items(), key=lambda kv: (str(kv[1]).lower(), str(kv[1])))
 
 
+async def _verdict(
+    file: DriveFile,
+    dest: Path,
+    *,
+    verify: bool,
+    skip_existing: bool,
+    resume: bool,
+) -> FilePlan:
+    """Decide what `download` would do with one file.
+
+    :param file: the Drive metadata to compare against.
+    :param dest: the local path it would be written to.
+    :param verify: compare md5 as well as size.
+    :param skip_existing: report a matching file as skipped rather than fetched.
+    :param resume: account for a ``.part`` file left by an interrupted run.
+    :returns: the verdict for this one file.
+    """
+    present, reason = await _local_state(file, dest, verify)
+    if present and skip_existing:
+        return FilePlan(file, dest, Action.SKIP, reason)
+    if present:
+        reason = f"{reason}, but --overwrite given"
+    part = dest.with_name(dest.name + ".part")
+    # Exports ignore Range, so a .part is never resumable for them.
+    offset = usable_partial(part, file.size) if resume and not file.export else 0
+    if offset:
+        return FilePlan(
+            file, dest, Action.RESUME, f"{offset} bytes already in .part", offset
+        )
+    return FilePlan(file, dest, Action.DOWNLOAD, reason)
+
+
 async def plan(
     client: DriveClient,
     file_id: str,
     dest_dir: Path,
     *,
+    concurrency: int = 4,
     verify: bool = True,
     skip_existing: bool = True,
     resume: bool = True,
@@ -225,6 +258,9 @@ async def plan(
     :param client: the Drive client to read metadata through.
     :param file_id: id of the folder or file to inspect.
     :param dest_dir: the directory files would be mirrored into.
+    :param concurrency: how many files to compare at once. Verification hashes
+        every file already on disk, so this is the same knob `download` uses
+        for transfers, applied to the phase that is actually slow here.
     :param verify: compare md5 as well as size, as `download` would.
     :param skip_existing: report matching files as skipped rather than fetched.
     :param resume: account for ``.part`` files left by an interrupted run.
@@ -234,30 +270,32 @@ async def plan(
     :returns: one :class:`FilePlan` per file, ordered by destination path.
     """
     targets = await _targets(client, file_id, on_listed)
-    total = len(targets)
-    out = DownloadPlan()
-    for done, (f, rel) in enumerate(_by_path(targets), start=1):
-        dest = dest_dir / rel
-        present, reason = await _local_state(f, dest, verify)
+    ordered = _by_path(targets)
+    total = len(ordered)
+    sem = asyncio.Semaphore(max(1, concurrency))
+    done = 0
+
+    async def compare(f: DriveFile, rel: Path) -> FilePlan:
+        nonlocal done
+        async with sem:
+            entry = await _verdict(
+                f,
+                dest_dir / rel,
+                verify=verify,
+                skip_existing=skip_existing,
+                resume=resume,
+            )
+        # Comparisons finish out of order once concurrency > 1, so progress is
+        # a completion count rather than the position in `ordered`.
+        done += 1
         if on_compared:
             on_compared(done, total)
-        if present and skip_existing:
-            out.entries.append(FilePlan(f, dest, Action.SKIP, reason))
-            continue
-        if present:
-            reason = f"{reason}, but --overwrite given"
-        part = dest.with_name(dest.name + ".part")
-        # Exports ignore Range, so a .part is never resumable for them.
-        offset = usable_partial(part, f.size) if resume and not f.export else 0
-        if offset:
-            out.entries.append(
-                FilePlan(
-                    f, dest, Action.RESUME, f"{offset} bytes already in .part", offset
-                )
-            )
-        else:
-            out.entries.append(FilePlan(f, dest, Action.DOWNLOAD, reason))
-    return out
+        return entry
+
+    # `gather` preserves argument order, so the report stays sorted by path
+    # even though the comparisons themselves raced.
+    entries = await asyncio.gather(*(compare(f, rel) for f, rel in ordered))
+    return DownloadPlan(entries=list(entries))
 
 
 async def download(

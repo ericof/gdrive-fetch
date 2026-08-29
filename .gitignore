@@ -1,8 +1,6 @@
 .venv/
 __pycache__/
 *.egg-info/
-data/*
-!data/.gitkeep
 .env
 .ipynb_checkpoints/
 .coverage

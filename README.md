@@ -89,8 +89,9 @@ folder the comparison is the slow half, because verification hashes every file
 that is already there — pass `--no-verify` to compare on size alone, which
 needs only a `stat()` per file. `-q` silences both; the table still prints.
 
-Note that `-j` only bounds parallel *transfers*: a dry run never transfers, and
-compares files one at a time.
+`-j` bounds a dry run too: that many files are compared at once, which is
+what makes `--verify` bearable on a large folder. The report is still
+ordered by path regardless of the order the comparisons finish in.
 
 ## Library use
 

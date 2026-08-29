@@ -15,6 +15,11 @@ from gdrive_fetch.models import DriveFile
 from pathlib import Path
 from pathlib import PurePosixPath
 
+import hashlib
+import pytest
+import threading
+import time
+
 
 DATA = bytes(range(256)) * 4
 
@@ -481,3 +486,72 @@ async def test_plan_ordering_is_case_insensitive_but_total(
     names = [e.dest.name for e in once.entries]
     assert names == ["A.bin", "a.bin", "b.bin"]
     assert names == [e.dest.name for e in twice.entries]
+
+
+async def test_plan_comparisons_are_bounded_by_concurrency(
+    drive: FakeDrive,
+    client: DriveClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run honours `-j`: hashing is the slow half, so it must fan out."""
+    root = drive.folder("root")
+    for i in range(8):
+        drive.file(f"f{i}.bin", DATA, root)
+        (tmp_path / f"f{i}.bin").write_bytes(DATA)
+
+    lock = threading.Lock()
+    inflight = 0
+    peak = 0
+
+    def slow_md5(path: Path) -> str:
+        nonlocal inflight, peak
+        with lock:
+            inflight += 1
+            peak = max(peak, inflight)
+        time.sleep(0.02)
+        with lock:
+            inflight -= 1
+        return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324
+
+    monkeypatch.setattr("gdrive_fetch.downloader._md5", slow_md5)
+
+    await plan(client, root, tmp_path, concurrency=2)
+    assert peak <= 2
+
+    peak = 0
+    await plan(client, root, tmp_path, concurrency=8)
+    assert peak >= 4  # parallelism actually happens
+
+
+async def test_plan_survives_comparisons_finishing_out_of_order(
+    drive: FakeDrive,
+    client: DriveClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Progress counts completions, and rows stay in path order regardless."""
+    # `a.bin` sorts first but hashes slowest, so it finishes last.
+    delays = {"a.bin": 0.06, "b.bin": 0.03, "c.bin": 0.0}
+    root = drive.folder("root")
+    for name in delays:
+        drive.file(name, DATA, root)
+        (tmp_path / name).write_bytes(DATA)
+
+    def staggered_md5(path: Path) -> str:
+        time.sleep(delays[path.name])
+        return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324
+
+    monkeypatch.setattr("gdrive_fetch.downloader._md5", staggered_md5)
+
+    compared: list[tuple[int, int]] = []
+    result = await plan(
+        client,
+        root,
+        tmp_path,
+        concurrency=3,
+        on_compared=lambda done, total: compared.append((done, total)),
+    )
+
+    assert compared == [(1, 3), (2, 3), (3, 3)]
+    assert [e.dest.name for e in result.entries] == ["a.bin", "b.bin", "c.bin"]

@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=4,
-        help="Number of parallel downloads (default: 4)",
+        help="Parallel downloads, or file comparisons in a dry run (default: 4)",
     )
     auth = p.add_argument_group("authentication")
     auth.add_argument(
@@ -199,6 +199,7 @@ async def _run(args: argparse.Namespace) -> int:
                     client,
                     args.target,
                     args.output,
+                    concurrency=args.jobs,
                     verify=not args.no_verify,
                     skip_existing=not args.overwrite,
                     resume=not args.no_resume,

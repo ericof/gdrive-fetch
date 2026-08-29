@@ -15,6 +15,12 @@ dependencies = [
 [project.scripts]
 gdrive-fetch = "gdrive_fetch.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/ericof/gdrive-fetch"
+Repository = "https://github.com/ericof/gdrive-fetch"
+Issues = "https://github.com/ericof/gdrive-fetch/issues"
+Changelog = "https://github.com/ericof/gdrive-fetch/blob/main/CHANGELOG.md"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
