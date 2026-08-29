@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from enum import StrEnum
 from pathlib import Path
+from rich.console import Console
 from rich.progress import BarColumn
 from rich.progress import DownloadColumn
 from rich.progress import Progress
@@ -88,12 +89,31 @@ class DownloadPlan:
         return sum(1 for e in self.entries if e.transfer_bytes is None)
 
 
-async def collect(client: DriveClient, file_id: str) -> tuple[list[DriveFile], bool]:
-    """Return (files, is_folder). A single-file id yields a one-item list."""
+async def collect(
+    client: DriveClient, file_id: str, on_listed: Callable[[int], None] | None = None
+) -> tuple[list[DriveFile], bool]:
+    """Return (files, is_folder). A single-file id yields a one-item list.
+
+    :param client: the Drive client to list through.
+    :param file_id: id of a folder or of a single file.
+    :param on_listed: called with the running count as files are discovered.
+    :returns: every file found, and whether `file_id` was a folder.
+    """
     root = await client.get_file(file_id)
     if not root.is_folder:
+        if on_listed:
+            on_listed(1)
         return [root], False
-    files = [f async for f in client.walk(file_id)]
+
+    seen = 0
+
+    def bump(_: DriveFile) -> None:
+        nonlocal seen
+        seen += 1
+        if on_listed:
+            on_listed(seen)
+
+    files = [f async for f in client.walk(file_id, on_file=bump)]
     return files, True
 
 
@@ -153,17 +173,35 @@ async def _already_present(file: DriveFile, dest: Path, verify: bool) -> bool:
     return present
 
 
-async def _targets(client: DriveClient, file_id: str) -> dict[DriveFile, Path]:
+async def _targets(
+    client: DriveClient, file_id: str, on_listed: Callable[[int], None] | None = None
+) -> dict[DriveFile, Path]:
     """Map every file under `file_id` to its path relative to the output dir.
 
     :param client: the Drive client to list through.
     :param file_id: id of a folder or of a single file.
+    :param on_listed: called with the running count as files are discovered.
     :returns: each file with the relative path it would be written to.
     """
-    files, is_folder = await collect(client, file_id)
+    files, is_folder = await collect(client, file_id, on_listed)
     if not is_folder:
         return {files[0]: Path(files[0].local_name)}
     return _dedupe(files)
+
+
+def _by_path(targets: dict[DriveFile, Path]) -> list[tuple[DriveFile, Path]]:
+    """Order files the way a reader scans a listing: by path, then by name.
+
+    Drive returns children in no useful order, and subfolders are walked
+    concurrently, so without this a report's rows arrive effectively at random.
+    Case is ignored for the primary comparison — `a.txt` belongs next to
+    `B.txt`, not after it — with a case-sensitive tiebreak so the order is
+    still total.
+
+    :param targets: files mapped to the paths they would be written to.
+    :returns: the same pairs, sorted by path.
+    """
+    return sorted(targets.items(), key=lambda kv: (str(kv[1]).lower(), str(kv[1])))
 
 
 async def plan(
@@ -174,6 +212,8 @@ async def plan(
     verify: bool = True,
     skip_existing: bool = True,
     resume: bool = True,
+    on_listed: Callable[[int], None] | None = None,
+    on_compared: Callable[[int, int], None] | None = None,
 ) -> DownloadPlan:
     """Work out what `download` would do, without transferring anything.
 
@@ -188,12 +228,19 @@ async def plan(
     :param verify: compare md5 as well as size, as `download` would.
     :param skip_existing: report matching files as skipped rather than fetched.
     :param resume: account for ``.part`` files left by an interrupted run.
-    :returns: one :class:`FilePlan` per file, in listing order.
+    :param on_listed: called with the running count while Drive is listed.
+    :param on_compared: called ``(done, total)`` after each local comparison,
+        which is the slow half when `verify` makes it hash existing files.
+    :returns: one :class:`FilePlan` per file, ordered by destination path.
     """
+    targets = await _targets(client, file_id, on_listed)
+    total = len(targets)
     out = DownloadPlan()
-    for f, rel in (await _targets(client, file_id)).items():
+    for done, (f, rel) in enumerate(_by_path(targets), start=1):
         dest = dest_dir / rel
         present, reason = await _local_state(f, dest, verify)
+        if on_compared:
+            on_compared(done, total)
         if present and skip_existing:
             out.entries.append(FilePlan(f, dest, Action.SKIP, reason))
             continue
@@ -223,6 +270,7 @@ async def download(
     skip_existing: bool = True,
     resume: bool = True,
     quiet: bool = False,
+    on_listed: Callable[[int], None] | None = None,
     on_file_done: Callable[[DriveFile, Path], None] | None = None,
 ) -> DownloadReport:
     """Download `file_id` (a folder or a single file) into `dest_dir`.
@@ -232,8 +280,22 @@ async def download(
     - Existing files whose size/md5 match are skipped when `skip_existing`.
     - md5 is verified after download when `verify` and Drive reports one.
     - Partial `.part` files from an interrupted run are continued when `resume`.
+
+    :param on_listed: called with the running count while Drive is listed.
+        Given one, the built-in listing spinner steps aside for it.
     """
-    targets = await _targets(client, file_id)
+    # Listing has to finish before the transfer bars start: rich allows only
+    # one live display at a time, and the tree size is unknown until then.
+    if on_listed is not None:
+        targets = await _targets(client, file_id, on_listed)
+    else:
+        status_console = Console(quiet=quiet)
+        with status_console.status("[bold]Listing Drive[/]") as status:
+            targets = await _targets(
+                client,
+                file_id,
+                lambda found: status.update(f"[bold]Listing Drive[/] — {found} files"),
+            )
 
     report = DownloadReport()
     sem = asyncio.Semaphore(max(1, concurrency))

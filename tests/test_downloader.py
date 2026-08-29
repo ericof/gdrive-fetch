@@ -384,3 +384,100 @@ async def test_plan_agrees_with_what_download_then_does(
     assert before["partial.bin"].action is Action.RESUME
     assert report.skipped == [tmp_path / "done.bin"]
     assert sorted(p.name for p in report.downloaded) == ["fresh.bin", "partial.bin"]
+
+
+async def test_plan_reports_listing_and_comparison_progress(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", b"aaa", root)
+    sub = drive.folder("sub", root)
+    drive.file("b.bin", b"bbbb", sub)
+    drive.file("c.bin", b"ccccc", sub)
+
+    listed: list[int] = []
+    compared: list[tuple[int, int]] = []
+
+    await plan(
+        client,
+        root,
+        tmp_path,
+        on_listed=listed.append,
+        on_compared=lambda done, total: compared.append((done, total)),
+    )
+
+    assert listed == [1, 2, 3]  # a running count, one call per file found
+    assert compared == [(1, 3), (2, 3), (3, 3)]  # done/total, once per file
+
+
+async def test_plan_reports_progress_for_a_single_file_target(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    fid = drive.file("solo.bin", b"x", None)
+
+    listed: list[int] = []
+    compared: list[tuple[int, int]] = []
+
+    await plan(
+        client,
+        fid,
+        tmp_path,
+        on_listed=listed.append,
+        on_compared=lambda done, total: compared.append((done, total)),
+    )
+
+    assert listed == [1]
+    assert compared == [(1, 1)]
+
+
+async def test_download_reports_listing_progress(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", b"aaa", root)
+    drive.file("b.bin", b"bbb", root)
+
+    listed: list[int] = []
+    report = await download(client, root, tmp_path, quiet=True, on_listed=listed.append)
+
+    assert report.ok
+    assert listed == [1, 2]
+
+
+async def test_plan_is_ordered_by_path(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    """Rows come out alphabetically, not in Drive's arbitrary listing order."""
+    root = drive.folder("root")
+    zebra = drive.folder("zebra", root)
+    alpha = drive.folder("alpha", root)
+    for name in ("m.bin", "B.bin", "a.bin"):
+        drive.file(name, b"x", root)
+    drive.file("z.bin", b"x", zebra)
+    drive.file("y.bin", b"x", alpha)
+
+    result = await plan(client, root, tmp_path)
+
+    assert [e.dest.relative_to(tmp_path).as_posix() for e in result.entries] == [
+        "a.bin",
+        "alpha/y.bin",
+        "B.bin",
+        "m.bin",
+        "zebra/z.bin",
+    ]
+
+
+async def test_plan_ordering_is_case_insensitive_but_total(
+    drive: FakeDrive, client: DriveClient, tmp_path: Path
+) -> None:
+    """`a` sorts next to `A`, and files differing only in case keep a stable order."""
+    root = drive.folder("root")
+    for name in ("b.bin", "A.bin", "a.bin"):
+        drive.file(name, b"x", root)
+
+    once = await plan(client, root, tmp_path)
+    twice = await plan(client, root, tmp_path)
+
+    names = [e.dest.name for e in once.entries]
+    assert names == ["A.bin", "a.bin", "b.bin"]
+    assert names == [e.dest.name for e in twice.entries]

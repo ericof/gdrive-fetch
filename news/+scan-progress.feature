@@ -1,0 +1,1 @@
+Report progress while listing Drive and while comparing against the output folder, so long runs (especially `--dry-run` over a large folder) no longer look like a hang. Order the dry-run report by path. @ericof

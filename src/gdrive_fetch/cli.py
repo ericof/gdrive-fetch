@@ -8,9 +8,18 @@ from .downloader import Action
 from .downloader import download
 from .downloader import DownloadPlan
 from .downloader import plan
+from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from rich.console import Console
 from rich.filesize import decimal
+from rich.progress import BarColumn
+from rich.progress import MofNCompleteColumn
+from rich.progress import Progress
+from rich.progress import SpinnerColumn
+from rich.progress import TextColumn
+from rich.progress import TimeElapsedColumn
 from rich.table import Table
 
 import argparse
@@ -88,6 +97,47 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+@contextmanager
+def _scan_feedback(
+    quiet: bool,
+) -> Iterator[tuple[Callable[[int], None], Callable[[int, int], None]]]:
+    """Live progress for the two silent phases of a dry run.
+
+    Listing Drive is unbounded — the size of the tree is unknown until it has
+    been walked — so that phase shows a spinner and a running count. Comparing
+    against the output folder has a known total and gets a real bar; it is the
+    slow half whenever md5 verification is on.
+
+    :param quiet: suppress the display entirely.
+    :returns: the ``on_listed`` and ``on_compared`` callbacks for `plan`.
+    """
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=Console(stderr=True),
+        transient=True,
+        disable=quiet,
+    )
+    with progress:
+        task = progress.add_task("Listing Drive", total=None)
+
+        def listed(found: int) -> None:
+            progress.update(task, completed=found)
+
+        def compared(done: int, total: int) -> None:
+            progress.update(
+                task,
+                completed=done,
+                total=total,
+                description="Comparing with output folder",
+            )
+
+        yield listed, compared
+
+
 _ACTION_STYLE = {
     Action.DOWNLOAD: "green",
     Action.RESUME: "cyan",
@@ -144,14 +194,17 @@ async def _run(args: argparse.Namespace) -> int:
     )
     async with DriveClient(TokenProvider(creds)) as client:
         if args.dry_run:
-            result = await plan(
-                client,
-                args.target,
-                args.output,
-                verify=not args.no_verify,
-                skip_existing=not args.overwrite,
-                resume=not args.no_resume,
-            )
+            with _scan_feedback(args.quiet) as (listed, compared):
+                result = await plan(
+                    client,
+                    args.target,
+                    args.output,
+                    verify=not args.no_verify,
+                    skip_existing=not args.overwrite,
+                    resume=not args.no_resume,
+                    on_listed=listed,
+                    on_compared=compared,
+                )
             _render_plan(result, args.output)
             return 0
 

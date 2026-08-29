@@ -250,3 +250,37 @@ async def test_export_google_doc_never_resumes(
     assert dest.read_bytes() == b"<docx bytes>"
     [req] = [r for r in drive.requests if r.url.path.endswith("/export")]
     assert "Range" not in req.headers
+
+
+async def test_walk_reports_every_file_as_it_is_found(
+    drive: FakeDrive, client: DriveClient
+) -> None:
+    """`on_file` must fire inside the concurrent descent, not just at the top.
+
+    walk() yields a subfolder's files only after gathering the whole branch, so
+    a caller counting yields sees nothing while the tree is being walked. The
+    callback is what makes a live count possible.
+    """
+    root = drive.folder("root")
+    sub = drive.folder("sub", root)
+    deep = drive.folder("deep", sub)
+    drive.file("a.bin", b"a", root)
+    drive.file("b.bin", b"b", sub)
+    drive.file("c.bin", b"c", deep)
+
+    seen: list[str] = []
+    yielded = [
+        f.name async for f in client.walk(root, on_file=lambda f: seen.append(f.name))
+    ]
+
+    assert sorted(seen) == ["a.bin", "b.bin", "c.bin"]
+    assert sorted(yielded) == sorted(seen)
+
+
+async def test_walk_without_callback_is_unchanged(
+    drive: FakeDrive, client: DriveClient
+) -> None:
+    root = drive.folder("root")
+    drive.file("a.bin", b"a", root)
+
+    assert [f.name async for f in client.walk(root)] == ["a.bin"]

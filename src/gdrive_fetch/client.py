@@ -21,6 +21,7 @@ LIST_FIELDS = f"nextPageToken,files({FILE_FIELDS})"
 RETRYABLE = {403, 408, 429, 500, 502, 503, 504}
 
 ProgressCallback = Callable[[int], None]
+FileCallback = Callable[["DriveFile"], None]
 
 
 class DriveError(RuntimeError):
@@ -101,7 +102,10 @@ class DriveClient:
             params["pageToken"] = token
 
     async def walk(
-        self, folder_id: str, prefix: PurePosixPath | None = None
+        self,
+        folder_id: str,
+        prefix: PurePosixPath | None = None,
+        on_file: FileCallback | None = None,
     ) -> AsyncIterator[DriveFile]:
         """Yield every non-folder file under `folder_id`, depth-first.
 
@@ -109,6 +113,10 @@ class DriveClient:
 
         :param folder_id: id of the folder to descend into.
         :param prefix: path the yielded files are made relative to.
+        :param on_file: called the moment a file is discovered, including
+            inside the concurrent descent into subfolders. Files are *yielded*
+            only once a whole branch has been drained, so a caller counting
+            yields would see nothing at all while the tree is being walked.
         :returns: an async iterator over every non-folder descendant.
         """
         prefix = PurePosixPath() if prefix is None else prefix
@@ -130,12 +138,15 @@ class DriveClient:
             if item["mimeType"] == FOLDER_MIME:
                 subfolders.append((item["id"], prefix / _safe_name(item["name"])))
             else:
-                yield _to_drive_file(item, prefix / _safe_name(item["name"]))
+                found = _to_drive_file(item, prefix / _safe_name(item["name"]))
+                if on_file:
+                    on_file(found)
+                yield found
 
         # Listing is cheap; fan out over subfolders but drain them sequentially
         # so ordering stays deterministic per branch.
         results = await asyncio.gather(*[
-            _collect(self.walk(fid, sub)) for fid, sub in subfolders
+            _collect(self.walk(fid, sub, on_file)) for fid, sub in subfolders
         ])
         for branch in results:
             for f in branch:

@@ -63,21 +63,34 @@ uv run gdrive-fetch <FOLDER_URL_OR_ID> -o ./out --dry-run
 
 ```
  action     file                 size   why
- download   fresh.bin          5.0 kB   missing locally
- skip       done.bin           1.0 kB   size and md5 match
- resume     partial.bin        1.0 kB   300 bytes already in .part
  download   changed.bin        1.0 kB   md5 differs
+ skip       done.bin           1.0 kB   size and md5 match
+ download   fresh.bin          5.0 kB   missing locally
  download   Meeting Notes.docx      ?   missing locally
+ resume     partial.bin        1.0 kB   300 bytes already in .part
  download   reports/q3.bin   900.0 kB   missing locally
 
 4 to download, 1 to resume, 1 up to date — 906.7 kB to transfer
 (+1 of unknown size) into ./out
 ```
 
+Rows are ordered by destination path, ignoring case, so the report reads the
+same way twice running — Drive itself returns children in no useful order.
+
 The comparison honours the same flags as a real run, so `--no-verify` (size
 only, no md5), `--overwrite` and `--no-resume` all change the plan the way they
 would change the download. Google-native exports have no size or md5 to compare,
 so they are always listed as `download` with an unknown size.
+
+Both phases report progress while they work: a spinner and a running count
+while the Drive tree is listed (its size is unknown until it has been walked),
+then a bar while each file is compared against the output folder. On a large
+folder the comparison is the slow half, because verification hashes every file
+that is already there — pass `--no-verify` to compare on size alone, which
+needs only a `stat()` per file. `-q` silences both; the table still prints.
+
+Note that `-j` only bounds parallel *transfers*: a dry run never transfers, and
+compares files one at a time.
 
 ## Library use
 
